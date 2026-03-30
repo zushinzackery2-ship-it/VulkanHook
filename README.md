@@ -17,30 +17,108 @@
 
 > [!IMPORTANT]
 > **仓库定位**  
-> 本仓库只负责 Vulkan 底层切入、Layer 链接和 runtime 跟踪。  
-> 不负责 GUI、录屏、控制器，也不反向依赖上层仓库。
+> 本仓库只负责 Vulkan Layer 导出、dispatch 搭桥、runtime 跟踪和回调派发。  
+> 它不负责 GUI、录屏、控制器，也不再包含非 Layer Vulkan 回退路径。
 
 > [!NOTE]
-> **Layer 模式说明**  
-> 本库通过 Vulkan Implicit Layer 机制注入目标进程，无需修改目标程序代码。  
-> Layer 在 `vkCreateInstance` / `vkCreateDevice` 时自动激活，拦截关键渲染路径。
-
----
+> **Layer 说明**  
+> 当前正式路径只有 `Implicit Layer`。  
+> `Runtime Probe`、`HasTrackedActivity()`、`HasRecognizedBackend()` 这些状态只反映“当前进程里有没有观察到 Vulkan 活动”，不代表本库在做额外注入。
 
 ## 特性
 
 | 功能 | 说明 |
 |:-----|:-----|
-| **Implicit Layer 注入** | 通过 `vkNegotiateLoaderLayerInterfaceVersion` 协商接口版本，向 Loader 注册 `VK_LAYER_PVRC_capture`，在 Instance / Device 创建时自动插入调用链 |
-| **Dispatch Table 拦截** | Layer 创建时从 `VkLayerInstanceCreateInfo` / `VkLayerDeviceCreateInfo` 获取下层 `GetInstanceProcAddr` / `GetDeviceProcAddr`，构建独立的 `InstanceDispatch` / `DeviceDispatch` 分发表 |
-| **Surface 跟踪** | 拦截 `vkCreateWin32SurfaceKHR` / `vkDestroySurfaceKHR`，记录 `VkSurfaceKHR → HWND → VkInstance` 映射，为后续 Swapchain 关联窗口句柄 |
-| **Swapchain 跟踪** | 拦截 `vkCreateSwapchainKHR` / `vkDestroySwapchainKHR`，记录 Format / ImageCount / Extent，支持 Late Attach（中途注入时自动补全缺失信息） |
-| **Queue 跟踪** | 拦截 `vkGetDeviceQueue` / `vkGetDeviceQueue2`，记录 `VkQueue → VkDevice → QueueFamilyIndex` 映射 |
-| **Device 跟踪** | 拦截 `vkCreateDevice`，读取 `VkPhysicalDeviceMemoryProperties`，缓存 MemoryType 标志位供上层分配 Staging Buffer |
-| **Present 回调** | 拦截 `vkQueuePresentKHR`，在每帧提交前调用用户回调，传递完整的 `VkhHookRuntime` 快照（Device / Queue / Swapchain / ImageIndex / Extent） |
-| **Late Attach** | 即使 Layer 在 Swapchain 创建后才激活，也能通过 `vkAcquireNextImageKHR` 和窗口枚举自动补全 Swapchain 信息 |
-| **Runtime Probe** | 后台线程轮询 `vulkan-1.dll` 加载状态，检测后端是否已就绪 |
-| **线程安全** | 全局状态使用 `std::mutex` 保护，多线程环境下安全调用 |
+| **Implicit Layer 注入** | 通过 `vkNegotiateLoaderLayerInterfaceVersion` 协商接口版本，并向 Loader 暴露本层导出 |
+| **Dispatch Table 拦截** | 在 `vkCreateInstance` / `vkCreateDevice` 期间保存下层 `gipa / gdpa` 并构建 dispatch 表 |
+| **Surface 跟踪** | 记录 `VkSurfaceKHR -> HWND -> VkInstance` 映射 |
+| **Swapchain 跟踪** | 记录 `VkSwapchainKHR` 的 format、imageCount、extent、关联 surface / device |
+| **Queue 跟踪** | 记录 `VkQueue -> VkDevice -> QueueFamilyIndex` |
+| **Device 跟踪** | 记录 `VkPhysicalDeviceMemoryProperties`，供上层挑选 readback memory type |
+| **Present 回调** | 在 `vkQueuePresentKHR` 路径组装 `VkhHookRuntime` 并触发 `onSetup / onRender` |
+| **Late Attach 补全** | 当 Layer 已生效但早期 swapchain 元数据未完整记录时，可在 acquire / present 路径补建记录 |
+| **Runtime Probe** | 后台观察 `vulkan-1.dll` 与关键过程，输出 tracked / recognized / ready 状态 |
+
+---
+
+## 架构
+
+```text
+应用程序
+  vkCreateInstance / vkCreateDevice / vkQueuePresentKHR / ...
+    |
+    v
+Vulkan Loader
+  枚举 Implicit Layer
+    |
+    v
+VK_LAYER_PVRC_capture
+  ├─ vkNegotiateLoaderLayerInterfaceVersion
+  ├─ vkGetInstanceProcAddr / vkGetDeviceProcAddr
+  ├─ InstanceDispatch
+  ├─ DeviceDispatch
+  └─ Tracking
+       ├─ Surface
+       ├─ Queue
+       ├─ Device
+       ├─ Swapchain
+       └─ Present runtime snapshot
+             |
+             v
+         用户回调 onSetup / onRender
+```
+
+---
+
+## 跟踪流程
+
+```text
+vkCreateInstance
+    │
+    ├─ 获取下层 GetInstanceProcAddr
+    ├─ 构建 InstanceDispatch
+    └─ 注册 surface / instance 相关拦截
+
+vkCreateDevice
+    │
+    ├─ 获取下层 GetDeviceProcAddr
+    ├─ 构建 DeviceDispatch
+    ├─ 读取 physical device memory properties
+    └─ 注册 queue / swapchain 相关拦截
+
+vkCreateWin32SurfaceKHR
+    └─ 记录 Surface -> HWND -> Instance
+
+vkCreateSwapchainKHR
+    └─ 记录 Swapchain -> Surface -> Device + format / extent / imageCount
+
+vkGetDeviceQueue / vkGetDeviceQueue2
+    └─ 记录 Queue -> Device -> QueueFamilyIndex
+
+vkAcquireNextImageKHR
+    └─ 在必要时补建 swapchain 条目并更新 imageIndex
+
+vkQueuePresentKHR
+    │
+    ├─ 组合完整 runtime snapshot
+    ├─ warmupFrames 后首次调用 onSetup
+    └─ 每帧调用 onRender
+```
+
+---
+
+## 当前 Late Attach 语义
+
+当前代码支持的是：
+
+- Layer 已经在调用链里
+- 但 swapchain 早期元数据没有完整跟踪到
+- 之后在 `vkAcquireNextImageKHR` / `vkQueuePresentKHR` 路径里补建缺失条目
+
+这不等于：
+
+- Layer 完全没加载
+- 之后还能把自己晚注入进同一条 Vulkan 调用链
 
 ---
 
@@ -49,191 +127,58 @@
 | 分类 | API | 说明 |
 |:-----|:----|:-----|
 | **初始化** | `VHK::FillDefaultDesc(desc)` | 填充默认配置 |
-|  | `VHK::Init(desc)` | 注册回调并激活 Layer 跟踪 |
-|  | `VHK::Shutdown()` | 卸载 Hook，清理状态 |
-| **状态查询** | `VHK::IsInstalled()` | 是否已调用 Init |
-|  | `VHK::IsLayerModeEnabled()` | 是否作为 Implicit Layer 加载 |
-|  | `VHK::HasTrackedActivity()` | 是否检测到 Vulkan 调用 |
+|  | `VHK::Init(desc)` | 注册回调并开始 runtime 跟踪 |
+|  | `VHK::Shutdown()` | 清理状态 |
+| **状态查询** | `VHK::IsInstalled()` | 是否已安装 |
+|  | `VHK::IsLayerModeEnabled()` | 当前是否以 Layer 方式生效 |
+|  | `VHK::HasTrackedActivity()` | 是否观察到 Vulkan 活动 |
 |  | `VHK::HasRecognizedBackend()` | 是否识别到有效后端 |
-|  | `VHK::IsReady()` | Runtime 是否完整可用 |
+|  | `VHK::IsReady()` | runtime 是否完整可用于上层 |
 | **运行时** | `VHK::GetRuntime()` | 获取当前 `VkhHookRuntime` 快照 |
-
----
-
-## 回调类型
-
-```cpp
-using VkhHookSetupCallback    = void (*)(const VkhHookRuntime* runtime, void* userData);
-using VkhHookRenderCallback   = void (*)(const VkhHookRuntime* runtime, void* userData);
-using VkhHookVisibleCallback  = bool (*)(void* userData);
-using VkhHookShutdownCallback = void (*)(void* userData);
-```
-
-**VkhHookRuntime 结构**：
-
-| 字段 | 类型 | 说明 |
-|:-----|:-----|:-----|
-| `hwnd` | `void*` | 渲染窗口句柄 |
-| `instance` | `void*` | `VkInstance` |
-| `physicalDevice` | `void*` | `VkPhysicalDevice` |
-| `device` | `void*` | `VkDevice` |
-| `queue` | `void*` | 当前帧使用的 `VkQueue` |
-| `swapchain` | `void*` | `VkSwapchainKHR` |
-| `queueFamilyIndex` | `UINT` | Queue Family 索引 |
-| `swapchainFormat` | `UINT` | `VkFormat` |
-| `memoryTypeCount` | `UINT` | 可用内存类型数量 |
-| `memoryTypeFlags[32]` | `UINT[]` | 各内存类型的 PropertyFlags |
-| `imageCount` | `UINT` | Swapchain Image 数量 |
-| `imageIndex` | `UINT` | 当前帧 Image 索引 |
-| `width` / `height` | `float` | 渲染分辨率 |
-| `frameCount` | `UINT` | 累计帧数 |
-
----
-
-## 架构
-
-```
-应用程序
-  vkCreateInstance / vkCreateDevice / vkQueuePresentKHR ...
-    |
-    v
-Vulkan Loader
-  枚举 Implicit Layer → 加载 VK_LAYER_PVRC_capture
-    |
-    | vkNegotiateLoaderLayerInterfaceVersion
-    v
-VulkanHook Layer
-  +-- InstanceDispatch (gipa / destroyInstance / ...)
-  +-- DeviceDispatch (gdpa / destroyDevice / ...)
-  +-- Tracking (Surface / Swapchain / Queue)
-        |
-        | vkQueuePresentKHR 拦截
-        v
-      DispatchPresent() → 用户回调 onSetup / onRender
-    |
-    v
-ICD (驱动)
-```
-
----
-
-## 跟踪流程
-
-```
-vkCreateInstance
-    │
-    ├─ Layer 获取下层 GetInstanceProcAddr
-    ├─ 构建 InstanceDispatch
-    └─ 注册 Surface / PhysicalDevice 拦截
-
-vkCreateDevice
-    │
-    ├─ Layer 获取下层 GetDeviceProcAddr
-    ├─ 构建 DeviceDispatch
-    ├─ 读取 PhysicalDeviceMemoryProperties
-    └─ 注册 Queue / Swapchain 拦截
-
-vkCreateWin32SurfaceKHR
-    └─ 记录 Surface → HWND → Instance 映射
-
-vkCreateSwapchainKHR
-    │
-    ├─ 记录 Swapchain → Surface → Device 映射
-    ├─ 缓存 Format / ImageCount / Extent
-    └─ 刷新 Runtime 快照
-
-vkGetDeviceQueue / vkGetDeviceQueue2
-    └─ 记录 Queue → Device → QueueFamilyIndex 映射
-
-vkAcquireNextImageKHR
-    │
-    ├─ Late Attach: 若 Swapchain 未跟踪，自动创建条目
-    └─ 更新 lastImageIndex
-
-vkQueuePresentKHR
-    │
-    ├─ 从 Tracking 表组装完整 Runtime
-    ├─ warmupFrames 后调用 onSetup（仅一次）
-    └─ 每帧调用 onRender
-```
 
 ---
 
 ## 目录结构
 
-```
+```text
 VulkanHook/
 └── VulkanHook/
     ├── include/vkh/
-    │   ├── vkh.h                    # 主入口，VHK 命名空间封装
-    │   ├── hook.h                   # VkhHook 静态类声明
-    │   ├── types.h                  # VkhHookDesc / VkhHookRuntime 定义
-    │   └── vkh_minimal.h            # 最小前置声明
+    │   ├── vkh.h
+    │   ├── hook.h
+    │   ├── types.h
+    │   └── vkh_minimal.h
     └── src/
-        ├── vkh_bootstrap.cpp        # Init / Shutdown / Probe 线程
-        ├── vkh_tracking.cpp         # Surface / Swapchain / Queue / Device 跟踪
-        ├── vkh_runtime_probe.cpp    # vulkan-1.dll 加载检测
-        ├── vkh_layer_exports.cpp    # Layer 导出函数 (vkGetInstanceProcAddr 等)
-        ├── vkh_layer_instance.cpp   # vkCreateInstance / vkDestroyInstance 拦截
-        ├── vkh_layer_runtime.cpp    # Layer 运行时状态
-        ├── vkh_layer_state.cpp      # Layer 全局状态管理
-        ├── vkh_layer_internal.h     # Layer 内部结构 (InstanceDispatch / DeviceDispatch)
-        ├── vkh_internal.h           # 模块内部状态 (ModuleState / SurfaceInfo / SwapchainInfo)
-        ├── vkh_internal_logger.h    # 内部日志
-        └── vkh_vk_minimal.h         # Vulkan 类型最小定义（避免依赖 SDK 头）
+        ├── vkh_bootstrap.cpp
+        ├── vkh_runtime_probe.cpp
+        ├── vkh_tracking.cpp
+        ├── vkh_layer_exports.cpp
+        ├── vkh_layer_instance.cpp
+        ├── vkh_layer_runtime.cpp
+        ├── vkh_layer_state.cpp
+        ├── vkh_layer_internal.h
+        ├── vkh_internal.h
+        └── vkh_vk_minimal.h
 ```
 
 ---
 
-## 快速开始
+## 集成
 
-```cpp
-#include <vkh/vkh.h>
+这是源码仓库，不跟踪仓库内 GUI、录屏器、controller、打包脚本或测试载荷。
 
-void OnSetup(const VkhHookRuntime* runtime, void* userData)
-{
-    // 首次就绪时调用，可在此初始化渲染资源
-}
-
-void OnRender(const VkhHookRuntime* runtime, void* userData)
-{
-    // 每帧 Present 前调用
-    // runtime->device / runtime->queue / runtime->swapchain 可用于提交命令
-}
-
-int main()
-{
-    VkhHookDesc desc;
-    VHK::FillDefaultDesc(&desc);
-    desc.onSetup = OnSetup;
-    desc.onRender = OnRender;
-    desc.warmupFrames = 3;
-
-    if (!VHK::Init(&desc))
-    {
-        return 1;
-    }
-
-    // ... 等待目标程序渲染 ...
-
-    VHK::Shutdown();
-    return 0;
-}
-```
+- 可以直接把 `VkhHook` 作为 Vulkan runtime 跟踪库接入
+- 也可以通过 `Universal-Render-Hook` 把 Vulkan 候选纳入统一后端仲裁
 
 ---
 
 ## 依赖方向
 
-```
-VulkanHook (本仓库)
-    ↑
-Universal-Render-Hook (可选上层)
-    ↑
-RainGui / InterRec (可选上层)
+```text
+VulkanHook
 ```
 
-`VulkanHook` 自身不依赖上层 GUI 封装、录制业务或 `Universal-Render-Hook`。
+`VulkanHook` 自身不依赖 `Universal-Render-Hook`、`RainGui` 或 `InterRec`。
 
 ---
 
