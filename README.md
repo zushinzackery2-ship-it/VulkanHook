@@ -22,7 +22,6 @@
 
 > [!NOTE]
 > **路径说明**  
-> 旧的 `VEH / late bootstrap / PageGuard` 以及 import-patch fallback 主业务路径已经移除。  
 > 当前正式路径只保留 Layer / runtime tracking。
 
 ## 目录
