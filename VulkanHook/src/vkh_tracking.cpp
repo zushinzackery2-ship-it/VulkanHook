@@ -171,21 +171,6 @@ namespace
 
 namespace VkhHookInternal
 {
-    void ObservePresentHit(VkQueue queue, const VkPresentInfoKHR* presentInfo)
-    {
-        if (!presentInfo || !presentInfo->pSwapchains)
-        {
-            return;
-        }
-
-        for (UINT index = 0; index < presentInfo->swapchainCount; ++index)
-        {
-            const UINT imageIndex = presentInfo->pImageIndices ? presentInfo->pImageIndices[index] : 0;
-            TrackAcquireImage(presentInfo->pSwapchains[index], imageIndex);
-            DispatchPresent(queue, presentInfo->pSwapchains[index], imageIndex);
-        }
-    }
-
     void TrackSurfaceCreated(VkInstance instance, VkSurfaceKHR surface, HWND hwnd)
     {
         std::lock_guard<std::mutex> lock(g_state.mutex);
@@ -564,10 +549,6 @@ namespace VkhHookInternal
             const bool runtimeReady = IsRuntimeReadyForCapture(g_state.runtime);
             const bool wasReady = g_state.ready;
             g_state.ready = runtimeReady;
-            if (runtimeReady && !g_state.layerModeEnabled && g_state.queuePresentDirectPatches.empty())
-            {
-                InstallLiveQueuePresentHooksLocked();
-            }
             if (runtimeReady && !wasReady)
             {
                 VKH_LOG(

@@ -15,11 +15,6 @@ namespace VkhHookInternal
             g_state.queues.clear();
         }
 
-        g_state.queuePresentDispatchPatches.clear();
-        g_state.queuePresentDispatchFailures.clear();
-        g_state.queuePresentDirectPatches.clear();
-        g_state.queuePresentSlotIndex = static_cast<SIZE_T>(-1);
-        g_state.queuePresentCommand = nullptr;
         g_state.runtimeProbeThreadId.store(0);
         g_state.runtimeProbeRequested = false;
         g_state.runtimeProbeStopRequested = false;
@@ -73,22 +68,6 @@ namespace VkhHookInternal
                 ::GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetProcAddress"));
         }
 
-        HMODULE ntdllModule = GetModuleHandleW(L"ntdll.dll");
-        if (ntdllModule && g_state.realGetProcAddress)
-        {
-            if (!g_state.ldrRegisterDllNotification)
-            {
-                g_state.ldrRegisterDllNotification = reinterpret_cast<LdrRegisterDllNotificationFn>(
-                    g_state.realGetProcAddress(ntdllModule, "LdrRegisterDllNotification"));
-            }
-
-            if (!g_state.ldrUnregisterDllNotification)
-            {
-                g_state.ldrUnregisterDllNotification = reinterpret_cast<LdrUnregisterDllNotificationFn>(
-                    g_state.realGetProcAddress(ntdllModule, "LdrUnregisterDllNotification"));
-            }
-        }
-
         g_state.vulkanModule = FindVulkanModuleLocked();
         if (g_state.vulkanModule && g_state.realGetProcAddress)
         {
@@ -104,104 +83,9 @@ namespace VkhHookInternal
         return GetModuleHandleW(L"vulkan-1.dll");
     }
 
-    bool EnsureHookingLocked()
-    {
-        ResolveLoaderFunctionsLocked();
-        if (!g_state.realGetProcAddress)
-        {
-            return false;
-        }
-
-        RegisterDllNotificationsLocked();
-        if (!PatchLoadedModulesLocked())
-        {
-            return false;
-        }
-
-        return true;
-    }
-
     void MarkLayerModeActiveLocked()
     {
         g_state.layerModeEnabled = true;
-    }
-
-    void RemoveHooksLocked()
-    {
-        for (auto it = g_state.queuePresentDirectPatches.rbegin();
-            it != g_state.queuePresentDirectPatches.rend();
-            ++it)
-        {
-            if (!it->slot)
-            {
-                continue;
-            }
-
-            __try
-            {
-                DWORD oldProtect = 0;
-                if (VirtualProtect(it->slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect))
-                {
-                    *it->slot = it->originalValue;
-                    VirtualProtect(it->slot, sizeof(void*), oldProtect, &oldProtect);
-                }
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-            }
-        }
-
-        for (auto it = g_state.queuePresentDispatchPatches.rbegin();
-            it != g_state.queuePresentDispatchPatches.rend();
-            ++it)
-        {
-            if (!it->slot)
-            {
-                continue;
-            }
-
-            __try
-            {
-                DWORD oldProtect = 0;
-                if (VirtualProtect(it->slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect))
-                {
-                    *it->slot = it->originalValue;
-                    VirtualProtect(it->slot, sizeof(void*), oldProtect, &oldProtect);
-                }
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-            }
-        }
-
-        for (auto it = g_state.iatPatches.rbegin(); it != g_state.iatPatches.rend(); ++it)
-        {
-            if (!it->slot)
-            {
-                continue;
-            }
-
-            __try
-            {
-                DWORD oldProtect = 0;
-                if (VirtualProtect(it->slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect))
-                {
-                    *it->slot = it->originalValue;
-                    VirtualProtect(it->slot, sizeof(void*), oldProtect, &oldProtect);
-                }
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-            }
-        }
-
-        g_state.queuePresentDirectPatches.clear();
-        g_state.queuePresentDispatchPatches.clear();
-        g_state.queuePresentDispatchFailures.clear();
-        g_state.queuePresentSlotIndex = static_cast<SIZE_T>(-1);
-        g_state.queuePresentCommand = nullptr;
-        g_state.iatPatches.clear();
-        UnregisterDllNotificationsLocked();
     }
 }
 
@@ -280,16 +164,12 @@ namespace VkhHook
                 return;
             }
 
-            RemoveHooksLocked();
             ResetTransientStateLocked();
             ZeroMemory(&g_state.desc, sizeof(g_state.desc));
             g_state.vulkanModule = nullptr;
             g_state.realGetProcAddress = nullptr;
             g_state.realVkGetInstanceProcAddr = nullptr;
             g_state.realVkGetDeviceProcAddr = nullptr;
-            g_state.ldrRegisterDllNotification = nullptr;
-            g_state.ldrUnregisterDllNotification = nullptr;
-            g_state.dllNotificationCookie = nullptr;
             g_state.layerModeEnabled = false;
             g_state.installed = false;
         }

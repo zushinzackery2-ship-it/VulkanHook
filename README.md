@@ -21,9 +21,9 @@
 > 不负责 GUI、录屏、控制器，也不反向依赖上层仓库。
 
 > [!NOTE]
-> **历史路径说明**  
-> 旧的 `VEH / late bootstrap / PageGuard` 主业务路径已经移除。  
-> 当前正式路径以 Layer / runtime tracking 为主。
+> **路径说明**  
+> 旧的 `VEH / late bootstrap / PageGuard` 以及 import-patch fallback 主业务路径已经移除。  
+> 当前正式路径只保留 Layer / runtime tracking。
 
 ## 目录
 
@@ -62,14 +62,6 @@ VulkanHook/
 - `VkhHookRuntime`
 
 ## 依赖方向
-
-```text
-VulkanHook
-    ↑
-Universal-Render-Hook
-    ↑
-RainGui / InterRec
-```
 
 `VulkanHook` 自身不依赖上层 GUI 封装、录制业务或 `Universal-Render-Hook`。
 
